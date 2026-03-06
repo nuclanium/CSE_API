@@ -1,19 +1,21 @@
-import argparse
 import csv
 import json
+import ssl
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
 
 MARKET_WATCH_JSON_FILE = "market_watch.json"
+MAX_TICKERS = 3
+START_DATE = (date.today() - timedelta(days=365)).isoformat()
 PAGE_LIMIT = 250
 SLEEP_SECONDS = 0.20
-OUTPUT_DIR = Path("cse_history_output")
+
+OUTPUT_DIR = Path("cse_history_output_top3")
 PER_TICKER_DIR = OUTPUT_DIR / "per_ticker"
 
 HISTORY_URLS = [
@@ -48,20 +50,12 @@ CSV_COLUMNS = [
 ]
 
 
+SSL_CONTEXT = ssl._create_unverified_context()
+
+
 def ensure_dirs() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     PER_TICKER_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def safe_get_json(url: str, params: dict, timeout: int = 60) -> dict:
-    full_url = f"{url}?{urlencode(params)}"
-    request = Request(full_url, headers=HEADERS)
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            payload = response.read().decode("utf-8")
-            return json.loads(payload)
-    except (HTTPError, URLError) as error:
-        raise RuntimeError(f"HTTP request failed: {error}") from error
 
 
 def load_json_file(path: str) -> dict:
@@ -99,27 +93,28 @@ def find_market_watch_items(obj: Any) -> Optional[List[dict]]:
     return None
 
 
-def get_ticker_id_map() -> Dict[str, int]:
+def get_first_three_tickers() -> List[tuple]:
     payload = load_json_file(MARKET_WATCH_JSON_FILE)
     items = find_market_watch_items(payload)
     if items is None:
         raise ValueError("Could not find market watch items in market_watch.json")
 
-    ticker_id_map: Dict[str, int] = {}
+    ticker_pairs: List[tuple] = []
     for item in items:
         ticker = item.get("ticker")
         field_symbol = item.get("field_symbol")
         if not ticker or field_symbol in (None, "", []):
             continue
         try:
-            ticker_id_map[str(ticker).strip().upper()] = int(str(field_symbol).strip())
+            ticker_pairs.append((str(ticker).strip().upper(), int(str(field_symbol).strip())))
         except ValueError:
             continue
 
-    return ticker_id_map
+    ticker_pairs.sort(key=lambda x: x[0])
+    return ticker_pairs[:MAX_TICKERS]
 
 
-def build_history_params(symbol_id: int, start_date: str, offset: int, limit: int) -> dict:
+def build_history_params(symbol_id: int, start_date: str, offset: int) -> dict:
     return {
         "fields[instrument_history]": (
             "symbol,created,openingPrice,coursCourant,highPrice,lowPrice,"
@@ -142,8 +137,18 @@ def build_history_params(symbol_id: int, start_date: str, offset: int, limit: in
         "filter[filter-historique-instrument-emetteur][condition][operator]": "=",
         "filter[filter-historique-instrument-emetteur][condition][value]": str(symbol_id),
         "page[offset]": str(offset),
-        "page[limit]": str(limit),
+        "page[limit]": str(PAGE_LIMIT),
     }
+
+
+def safe_get_json(url: str, params: dict, timeout: int = 60) -> dict:
+    full_url = f"{url}?{urlencode(params)}"
+    request = Request(full_url, headers=HEADERS)
+    try:
+        with urlopen(request, timeout=timeout, context=SSL_CONTEXT) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError) as error:
+        raise RuntimeError(f"HTTP request failed: {error}") from error
 
 
 def parse_float(value: Any) -> Optional[float]:
@@ -185,25 +190,13 @@ def extract_rows(payload: dict, ticker: str, symbol_id: int) -> List[dict]:
     return rows
 
 
-def sort_rows(rows: List[dict]) -> List[dict]:
-    def key(row: dict) -> tuple:
-        d = row.get("date") or ""
-        try:
-            parsed = datetime.strptime(d, "%Y-%m-%d")
-        except ValueError:
-            parsed = datetime.min
-        return row.get("ticker", ""), parsed
-
-    return sorted(rows, key=key)
-
-
-def fetch_full_history_for_ticker(ticker: str, symbol_id: int, start_date: str) -> List[dict]:
+def fetch_history_for_ticker(ticker: str, symbol_id: int) -> List[dict]:
     all_rows: List[dict] = []
     offset = 0
     preferred_url: Optional[str] = None
 
     while True:
-        params = build_history_params(symbol_id, start_date, offset, PAGE_LIMIT)
+        params = build_history_params(symbol_id, START_DATE, offset)
         payload = None
         last_error: Optional[Exception] = None
 
@@ -219,9 +212,7 @@ def fetch_full_history_for_ticker(ticker: str, symbol_id: int, start_date: str) 
                 last_error = error
 
         if payload is None:
-            raise RuntimeError(
-                f"Request failed for {ticker} (id={symbol_id}) at offset={offset}. Last error: {last_error}"
-            )
+            raise RuntimeError(f"Request failed for {ticker} (id={symbol_id}): {last_error}")
 
         rows = extract_rows(payload, ticker, symbol_id)
         if not rows:
@@ -234,7 +225,8 @@ def fetch_full_history_for_ticker(ticker: str, symbol_id: int, start_date: str) 
         offset += PAGE_LIMIT
         time.sleep(SLEEP_SECONDS)
 
-    return sort_rows(all_rows)
+    all_rows.sort(key=lambda x: (x.get("ticker", ""), x.get("date", "")))
+    return all_rows
 
 
 def write_csv(path: Path, rows: List[dict]) -> None:
@@ -244,34 +236,20 @@ def write_csv(path: Path, rows: List[dict]) -> None:
         writer.writerows(rows)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Download CSE historical data for up to 80 stocks.")
-    parser.add_argument("--start-date", help="Start date (YYYY-MM-DD). If omitted, --days is used.")
-    parser.add_argument("--days", type=int, default=365, help="Days back from today (default: 365).")
-    parser.add_argument("--max-stocks", type=int, default=80, help="Number of stocks to download (default: 80).")
-    return parser.parse_args()
-
-
 def main() -> None:
-    args = parse_args()
     ensure_dirs()
+    pairs = get_first_three_tickers()
 
-    start_date = args.start_date or (date.today() - timedelta(days=args.days)).isoformat()
-    ticker_id_map = get_ticker_id_map()
-    tickers = sorted(ticker_id_map.keys())[: args.max_stocks]
-
-    print(f"Loaded {len(ticker_id_map)} ticker/id mappings from {MARKET_WATCH_JSON_FILE}")
-    print(f"Using start date: {start_date}")
-    print(f"Tickers selected: {len(tickers)}")
+    print(f"Using start date: {START_DATE}")
+    print(f"Selected {len(pairs)} tickers (first 3 by symbol): {[p[0] for p in pairs]}")
 
     all_rows: List[dict] = []
     failures: List[dict] = []
 
-    for i, ticker in enumerate(tickers, start=1):
-        symbol_id = ticker_id_map[ticker]
-        print(f"[{i}/{len(tickers)}] Downloading {ticker} (id={symbol_id}) ...")
+    for i, (ticker, symbol_id) in enumerate(pairs, start=1):
+        print(f"[{i}/{len(pairs)}] Downloading {ticker} (id={symbol_id}) ...")
         try:
-            rows = fetch_full_history_for_ticker(ticker, symbol_id, start_date)
+            rows = fetch_history_for_ticker(ticker, symbol_id)
             print(f"  -> {len(rows)} rows")
             all_rows.extend(rows)
             write_csv(PER_TICKER_DIR / f"{ticker}.csv", rows)
@@ -282,10 +260,8 @@ def main() -> None:
         time.sleep(SLEEP_SECONDS)
 
     if all_rows:
-        write_csv(OUTPUT_DIR / "cse_history_all_stocks.csv", sort_rows(all_rows))
-        print("\nDone.")
-        print(f"Merged file: {OUTPUT_DIR / 'cse_history_all_stocks.csv'}")
-        print(f"Per-ticker folder: {PER_TICKER_DIR}")
+        write_csv(OUTPUT_DIR / "cse_history_top3_all.csv", all_rows)
+        print(f"Merged output: {OUTPUT_DIR / 'cse_history_top3_all.csv'}")
 
     if failures:
         fail_path = OUTPUT_DIR / "failures.json"
